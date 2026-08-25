@@ -1,0 +1,6 @@
+# Mount the host half. On every DSH start it verifies/re-applies the patch to
+# the packaged target modules, so a Desktop/package update cannot silently
+# remove the UX changes.
+- insert:
+    - id: session-reference-ux-patch
+      name: dsh-session-reference-ux-patch
