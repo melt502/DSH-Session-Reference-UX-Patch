@@ -13,7 +13,7 @@
 ## 命令
 
 ```powershell
-cd D:\chat\dsh-session-reference-ux-patch
+cd dsh-session-reference-ux-patch
 node bin\patch.mjs doctor
 node bin\patch.mjs apply
 node bin\patch.mjs restore
@@ -27,10 +27,10 @@ D:\dsh\DSH Desktop\resources\app.asar.unpacked
 
 ## 安装到 web profile
 
-在 `C:\Users\tt123\.dsh\profiles\web\package.json` 中加入：
+在 `<DSH_HOME>\profiles\web\package.json`（例如 `%USERPROFILE%\.dsh\profiles\web\package.json`）中加入：
 
 ```json
-"dsh-session-reference-ux-patch": "link:D:/chat/dsh-session-reference-ux-patch"
+"dsh-session-reference-ux-patch": "link:<repo-path>"
 ```
 
 并将 `dsh-session-reference-ux-patch` 加入 `dsh.profile.bundles`。随后重启 DSH Desktop。
