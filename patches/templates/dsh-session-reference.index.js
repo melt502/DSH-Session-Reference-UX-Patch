@@ -1,9 +1,11 @@
 import z from "@deepseek-ai/schemastery";
 import { Remote, TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
-import { assertNever, createUserMessage, freezeMessage } from "@deepseek-ai/dsh-llm";
+import { createUserMessage, freezeMessage } from "@deepseek-ai/dsh-llm";
+import { SessionLogOffset, SessionSeq } from "@deepseek-ai/dsh-session";
 import { isCompactCheckpointSource } from "@deepseek-ai/dsh-compaction";
 import { TextRetainer } from "@deepseek-ai/dsh-output-retention";
-import { SessionId } from "@deepseek-ai/dsh-session";
+import { assertNever } from "@deepseek-ai/dsh-util-values";
+import { brandString } from "@deepseek-ai/dsh-brand";
 //#region lib/types/config.js
 /** Configuration and stable diagnostics for session references. */
 /** Hard maximum references accepted by one message. */
@@ -88,7 +90,7 @@ function retainReferencedSession(snapshot, label, maxBytes) {
 		sessionId: snapshot.session.id,
 		label,
 		cwd: snapshot.session.cwd ?? null,
-		capturedThroughSeq: snapshot.capturedThroughSeq,
+		capturedThroughSeq: snapshot.capturedThroughSeq === null ? null : SessionSeq(snapshot.capturedThroughSeq),
 		conversation: retained.map(({ role, text }) => ({
 			role,
 			text
@@ -207,7 +209,7 @@ function decodeSessionReferenceUri(uri) {
 	try {
 		const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
 		if (typeof parsed !== "string") throw new TypeError("decoded session id is not a string");
-		const sessionId = SessionId(parsed);
+		const sessionId = brandString(parsed);
 		if (encodeSessionReferenceUri(sessionId) !== uri) throw new TypeError("URI is not canonical");
 		return sessionId;
 	} catch (error) {
@@ -360,7 +362,7 @@ let SessionReferenceResolver = (() => {
 				const decision = await next();
 				if (decision.kind === "reject") return decision;
 				return {
-					kind: "enter",
+					...decision,
 					messages: await this.prepareDirectMessages(agent, decision.messages, signal)
 				};
 			}, { prepend: true });
@@ -399,6 +401,10 @@ let SessionReferenceResolver = (() => {
 		}
 		/**
 		* List reference candidates, ranked by working-directory affinity.
+		*
+		* Discovery runs at keystroke rate, so a title only ever comes from a
+		* projection read: see {@link SessionReferenceResolver.projectedTitle} for
+		* which sessions can answer one and which fall back to their id.
 		* @param agent - target agent; self is excluded and its cwd drives ranking.
 		* @param query - optional case-insensitive session-id/cwd/title substring.
 		* @param limit - optional positive result cap.
@@ -410,31 +416,55 @@ let SessionReferenceResolver = (() => {
 			const needle = query.toLocaleLowerCase();
 			const targetCwd = agent.session.header.cwd;
 			assertNotCancelled(signal);
-			const records = (await settleWithCancellation(this.ctx.sessionQuery.listSessions(signal), signal)).filter((record) => record.header.id !== agent.id).map((record, index) => ({
+			return (await settleWithCancellation(this.ctx.sessionQuery.listSessions(signal), signal)).filter((record) => record.header.id !== agent.id).map((record, index) => ({
 				record,
 				index
-			}));
-			// The empty `@` menu displays at most eight sessions. Do not open and fold
-			// titles for the host-wide candidate limit (50) before the menu can render.
-			const emptyMenuLimit = Math.min(limit, 8);
-			const inspected = needle === "" ? records.filter(({ record }) => record.header.cwd === targetCwd).slice(0, emptyMenuLimit) : records;
-			const observations = await settleWithCancellation(this.ctx.sessionQuery.readTitleSnapshots(inspected.map(({ record }) => record.header.id), signal), signal);
-			return inspected.map(({ record, index }, observationIndex) => {
-				const observation = observations[observationIndex];
+			})).map(({ record, index }) => {
+				const projected = this.projectedTitle(record);
 				return {
 					record,
 					index,
-					label: observation.status === "fulfilled" && observation.value.title?.title.trim() ? observation.value.title.title : record.header.id
+					label: projected !== void 0 && projected.trim() !== "" ? projected : record.header.id
 				};
 			}).filter(({ record, label }) => {
 				if (needle === "") return targetCwd === void 0 ? record.header.cwd === void 0 : record.header.cwd === targetCwd;
 				return record.header.id.toLocaleLowerCase().includes(needle) || record.header.cwd?.toLocaleLowerCase().includes(needle) === true || label.toLocaleLowerCase().includes(needle);
-			}).sort((a, b) => candidateRank(a.record.header.cwd, targetCwd) - candidateRank(b.record.header.cwd, targetCwd) || a.index - b.index).slice(0, limit).map(({ record, label }) => ({
+			}).sort((a, b) => candidateRank(a.record.header.cwd, targetCwd) - candidateRank(b.record.header.cwd, targetCwd) || a.index - b.index).slice(0, needle === "" ? Math.min(limit, 8) : limit).map(({ record, label }) => ({
 				sessionId: record.header.id,
 				label,
 				...record.header.cwd === void 0 ? {} : { cwd: record.header.cwd },
+				sameWorkspace: record.header.cwd !== void 0 && record.header.cwd === targetCwd,
 				createdAt: record.header.createdAt
 			}));
+		}
+		/**
+		* The title a session's projections can answer without reading its log.
+		*
+		* Attachment is decided by the store at read time, not by the listing:
+		* a session that attached in between would otherwise be answered from a
+		* checkpoint its live log has already moved past.
+		*
+		* An attached session answers from its live registry cut, which advances
+		* with every committed event, so a rename or a just-generated title is
+		* visible immediately; its events are already in memory, so the lazy fold
+		* costs no I/O. A cold session answers from the durable checkpoint the
+		* projection cache wrote when it went cold.
+		*
+		* Nothing else is attempted. Folding a title from a log costs the whole
+		* log, and this call sits under every keystroke of `@` completion. A
+		* session that no projection can answer for — one persisted before the
+		* cache was composed, or seeded straight to disk — is labeled by its id
+		* and cannot be found by its title until it is opened once, which
+		* checkpoints it.
+		* @param record - the listed session, live or cold.
+		* @returns the projected title, or undefined when no projection holds one.
+		*/
+		projectedTitle(record) {
+			const attached = this.ctx.get("sessions")?.get(record.header.id);
+			const projections = this.ctx.get("sessionProjections");
+			if (attached !== void 0 && projections !== void 0) return titleOf(projections.snapshot(attached, ["title"]));
+			if (record.header.isSeeded) return void 0;
+			return titleOf(this.ctx.get("sessionProjectionCache")?.cachedSnapshot(record.header, SessionLogOffset(0), ["title"]));
 		}
 		/**
 		* Remote face of {@link listCandidates}: the configured candidate limit
@@ -533,6 +563,11 @@ function normalizeReferences(targetId, references, maxReferences) {
 }
 function renderPrompt(data) {
 	return `${PROMPT_PREFIX}${stringifyTagSafeJson(data)}${PROMPT_SUFFIX}`;
+}
+/** The title in one projection snapshot; undefined when the unit is absent or still untitled. */
+function titleOf(snapshot) {
+	const title = snapshot?.values.title;
+	return title === void 0 || title === null ? void 0 : title;
 }
 function candidateRank(candidateCwd, targetCwd) {
 	if (candidateCwd !== void 0 && targetCwd !== void 0 && candidateCwd === targetCwd) return 0;
